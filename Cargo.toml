@@ -1,0 +1,11 @@
+[package]
+name = "matrix-client-boilerplate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+matrix-sdk = "0.6.2"
+serde_json = "1"
+tokio = "1"
