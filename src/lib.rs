@@ -1,15 +1,21 @@
 use anyhow::Result;
-use matrix_sdk::{config::SyncSettings, ruma::UserId};
+use matrix_sdk::{config::SyncSettings, ruma::UserId, Session};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
 use tokio::task::JoinHandle;
 
+#[derive(Default)]
+struct Inner {
+    initial_sync_token: Option<String>,
+    _sync_task: Option<JoinHandle<()>>,
+}
+
 #[derive(Clone)]
 pub struct Client {
     client: matrix_sdk::Client,
-    _sync_task: Arc<Mutex<JoinHandle<()>>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Client {
@@ -34,11 +40,20 @@ impl Client {
             log::info!("Restored login");
 
             // Load the session from file
-            let session_file = std::fs::File::open(session_filename)?;
-            let session = serde_json::from_reader(session_file)?;
+            let session_file = std::fs::File::open(session_filename.clone())?;
+            let session: Session = serde_json::from_reader(session_file)?;
 
             // Login
-            client.restore_login(session).await?;
+            client
+                .login_username(user.localpart(), password)
+                .initial_device_display_name(device_name)
+                .device_id(session.device_id.as_str())
+                .send()
+                .await?;
+
+            // Restore session
+            // TODO: why does this not work correctly?
+            // client.restore_login(session).await?;
         } else {
             log::info!("Initial login");
 
@@ -48,40 +63,41 @@ impl Client {
                 .initial_device_display_name(device_name)
                 .send()
                 .await?;
-
-            // Save the session to file
-            let session = client.session().expect("Session should exist after login");
-            let session_file = std::fs::File::create(session_filename)?;
-            serde_json::to_writer(session_file, &session)?;
         }
 
-        log::info!("Performing initial sync");
-        client.sync_once(SyncSettings::default()).await?;
-
-        log::info!("Successfully logged in to Matrix homeserver");
-
-        let sync_task = Arc::new(Mutex::new(sync_background(client.clone()).await));
+        // Save the session to file
+        let session = client.session().expect("Session should exist after login");
+        let session_file = std::fs::File::create(session_filename)?;
+        serde_json::to_writer(session_file, &session)?;
 
         Ok(Self {
             client,
-            _sync_task: sync_task,
+            inner: Default::default(),
         })
     }
 
     pub fn client(&self) -> &matrix_sdk::Client {
         &self.client
     }
-}
 
-pub(crate) async fn sync_background(client: matrix_sdk::Client) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let settings = SyncSettings::default().token(
-            client
-                .sync_token()
-                .await
-                .expect("sync token should be available"),
-        );
+    pub async fn initial_sync(&self) -> Result<()> {
+        let response = self.client.sync_once(SyncSettings::default()).await?;
+        self.inner.lock().unwrap().initial_sync_token = Some(response.next_batch);
+        Ok(())
+    }
 
-        client.sync(settings).await.unwrap();
-    })
+    pub async fn start_background_sync(&self) {
+        let client = self.client.clone();
+
+        let mut inner = self.inner.lock().unwrap();
+
+        let mut settings = SyncSettings::default();
+        if let Some(token) = &inner.initial_sync_token {
+            settings = settings.token(token);
+        }
+
+        inner._sync_task = Some(tokio::spawn(async move {
+            client.sync(settings).await.unwrap();
+        }));
+    }
 }
